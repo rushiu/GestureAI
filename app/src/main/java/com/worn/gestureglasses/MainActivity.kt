@@ -57,6 +57,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private lateinit var consentText: TextView
     private lateinit var hintText: TextView
+    /** The last few signs along the bottom, so a glance away doesn't lose the conversation. */
+    private lateinit var historyText: TextView
+    private val history = ArrayDeque<String>()
     /** Until this time, the welcome card is shown (set each time the app comes to the front). */
     private var welcomeUntil = 0L
 
@@ -102,6 +105,14 @@ class MainActivity : AppCompatActivity() {
             textSize = 11f
             setPadding(16, 8, 16, 8)
         }
+        historyText = TextView(this).apply {
+            setTextColor(Color.rgb(0, 170, 0)) // dimmer green than the current sign
+            textSize = 20f
+            gravity = Gravity.CENTER
+            setPadding(16, 0, 16, 0)
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.START // keep the newest signs visible
+        }
         // Onboarding for whoever just put the glasses on: a welcome card, then a hint until the signer waves.
         hintText = TextView(this).apply {
             setTextColor(Color.WHITE)
@@ -121,6 +132,8 @@ class MainActivity : AppCompatActivity() {
             addView(bigText, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             // Just below the glasses' own status bar (clock, battery) at the top of the display.
             addView(consentText, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.TOP).apply { topMargin = 44 })
+            // Above the dim status line at the very bottom.
+            addView(historyText, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.BOTTOM).apply { bottomMargin = 34 })
             addView(statusText, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.START))
         }
         setContentView(root)
@@ -310,10 +323,22 @@ class MainActivity : AppCompatActivity() {
         hintText.setTextColor(if (consented) Color.rgb(120, 120, 120) else Color.WHITE)
     }
 
+    private fun addToHistory(phrase: String) {
+        history.addLast(phrase)
+        while (history.size > HISTORY_SIZE) history.removeFirst()
+        historyText.text = history.joinToString("  ·  ")
+    }
+
+    private fun clearHistory() {
+        history.clear()
+        if (::historyText.isInitialized) historyText.text = ""
+    }
+
     private fun checkConsentTimeout() {
         if (consented && SystemClock.uptimeMillis() - lastHandAt > CONSENT_TIMEOUT_MS) {
             consented = false
             smoother.reset()
+            runOnUiThread { clearHistory() } // signer left: start the next conversation clean
             Log.i(TAG, "consent: no hands for ${CONSENT_TIMEOUT_MS / 1000}s, waiting for a wave")
         }
     }
@@ -322,6 +347,7 @@ class MainActivity : AppCompatActivity() {
         val phrase = phrases[label] ?: label.replace('_', ' ')
         Log.i(TAG, "gesture $label -> $phrase")
         bigText.text = phrase
+        addToHistory(phrase)
         bigText.removeCallbacks(clearText)
         bigText.postDelayed(clearText, 3000)
         if (voiceReady) tts?.speak(phrase, TextToSpeech.QUEUE_FLUSH, null, "gesture")
@@ -387,6 +413,7 @@ class MainActivity : AppCompatActivity() {
         welcomeUntil = SystemClock.uptimeMillis() + WELCOME_MS
         consented = false
         smoother.reset()
+        clearHistory()
         updateStatus()
         hintText.postDelayed({ updateStatus() }, WELCOME_MS + 100)
     }
@@ -414,6 +441,7 @@ class MainActivity : AppCompatActivity() {
         private val START_LABELS = setOf("Open_Palm", "hello", "start")
         private const val CONSENT_TIMEOUT_MS = 30_000L
         private const val WELCOME_MS = 4_000L
+        private const val HISTORY_SIZE = 4
         const val NONE = "None"
     }
 }
