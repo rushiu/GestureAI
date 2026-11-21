@@ -277,9 +277,16 @@ class MainActivity : AppCompatActivity() {
             val result = model.recognizeForVideo(image, rotation, timestamp)
             var raw = NONE
             val hands = result.gestures()
-            if (hands.isNotEmpty() && hands[0].isNotEmpty()) {
-                val top = hands[0][0]
-                if (top.score() >= MIN_SCORE && top.categoryName().isNotBlank()) raw = top.categoryName()
+            if (hands.isNotEmpty() && hands[0].isNotEmpty() && result.landmarks().isNotEmpty() &&
+                handIsClear(result.landmarks()[0])
+            ) {
+                val guesses = hands[0]
+                val top = guesses[0]
+                val runnerUp = guesses.getOrNull(1)?.score() ?: 0f
+                // Confident, and clearly ahead of the next guess: near-ties are skipped.
+                if (top.score() >= MIN_SCORE && top.score() - runnerUp >= MIN_MARGIN &&
+                    top.categoryName().isNotBlank()
+                ) raw = top.categoryName()
             }
 
             if (result.landmarks().isNotEmpty()) lastHandAt = SystemClock.uptimeMillis()
@@ -292,6 +299,20 @@ class MainActivity : AppCompatActivity() {
         } finally {
             frame.close()
         }
+    }
+
+    /**
+     * A hand the model can read well: whole (no point at the frame's edge, where fingers get cut off)
+     * and big enough (far-away hands are a few pixels across and get misread).
+     * Landmark coordinates are 0..1 across the frame.
+     */
+    private fun handIsClear(points: List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark>): Boolean {
+        if (points.isEmpty()) return false
+        val xs = points.map { it.x() }
+        val ys = points.map { it.y() }
+        val inside = xs.all { it in EDGE..(1 - EDGE) } && ys.all { it in EDGE..(1 - EDGE) }
+        val size = maxOf(xs.max() - xs.min(), ys.max() - ys.min())
+        return inside && size >= MIN_HAND_SIZE
     }
 
     /** Consent gate: until the signer waves, only the wave itself is acted on. */
@@ -436,7 +457,14 @@ class MainActivity : AppCompatActivity() {
         private const val TAG = "Gesture"
         private const val MODEL_FILE = "gesture_recognizer.task"
         private const val CAMERA_REQUEST = 1
-        private const val MIN_SCORE = 0.6f
+        /** How sure the model must be (0..1). Was 0.6; 0.7 cuts most wrong readings. */
+        private const val MIN_SCORE = 0.7f
+        /** The top guess must beat the next one by this much. */
+        private const val MIN_MARGIN = 0.2f
+        /** Ignore hands touching the outer 2% of the frame (partly cut off). */
+        private const val EDGE = 0.02f
+        /** Ignore hands smaller than 12% of the frame (too far away to read reliably). */
+        private const val MIN_HAND_SIZE = 0.12f
         /** Gestures that mean "you may read my signs": the stock open palm, or a trained "hello"/"start" sign. */
         private val START_LABELS = setOf("Open_Palm", "hello", "start")
         private const val CONSENT_TIMEOUT_MS = 30_000L
@@ -476,6 +504,8 @@ class Smoother(
             return null
         }
         if (count < needed || winner == lastSent) return null
+        // The newest frame must agree too, so a hand passing between two signs doesn't fire a third.
+        if (history.last() != winner) return null
         val now = SystemClock.uptimeMillis()
         if (now - lastSentAt < cooldownMs) return null
 
