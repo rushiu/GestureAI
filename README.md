@@ -9,6 +9,35 @@ in front of you and shows the meaning in big green text (and speaks it, if the g
 - Status line (bottom-left of the display): camera, model, frames per second, voice.
 - Logs: `adb logcat -s Gesture`
 
+## ASL signs (alongside the gestures)
+
+After the signer waves hello (open palm), the app reads both at once:
+
+- **Gestures** (the list at the bottom): held hand shapes, such as thumbs up = Yes.
+- **ASL signs**: a pretrained model recognizes 250 everyday ASL signs that involve movement, such as
+  "thank you", "please", "bye", "mom" and "drink". No training needed. The model is the 1st-place entry from
+  Google's Kaggle "ASL Signs" competition ([sign/kaggle-asl-signs-1st-place](https://huggingface.co/sign/kaggle-asl-signs-1st-place), MIT);
+  the full word list is in `app/src/main/assets/sign_to_prediction_index_map.json` after the first build.
+
+How they share the work:
+
+- One hand tracker for both: the gesture model already finds the hand's 21 points, and the ASL reader uses
+  those, adding body and face points (`LandmarkExtractor.kt`).
+- A gesture only counts while the hand is held still; a moving hand is read as an ASL sign. Otherwise
+  flat-hand signs like "thank you" would also show as Open_Palm ("Hello").
+- A sign ends when the hand stops moving, is lowered, or after 2 seconds (`SignSegmenter.kt`).
+- After the wave, hands are only looked for above mid-torso, so a hand resting at the hip is ignored.
+
+Notes:
+
+- The models (about 20 MB) download on the first build and aren't committed.
+- ASL signs need the body and face as well as the hand, so the frame rate drops to about 3 fps while
+  someone signs (about 5-7 fps otherwise).
+- Best results: signer facing the wearer, about 1 m away, face and signing hand in view. One-handed signs
+  at the face or chest work best (hello, bye, mom, dad, please, drink, think). Single signs, not sentences.
+- Change what a sign shows or says: the ASL entries in `phrases` in `MainActivity.kt`.
+- Logs show each guess with its confidence: `adb logcat -s Gesture`. `MIN_SIGN_PROBABILITY` sets the cutoff.
+
 ## Voice (spoken gestures)
 
 The glasses don't come with a text-to-speech engine (the voice assistant uses its own, which other
