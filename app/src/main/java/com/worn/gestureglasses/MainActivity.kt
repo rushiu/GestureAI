@@ -367,7 +367,8 @@ class MainActivity : AppCompatActivity() {
         checkConsentTimeout()
         consentText.text = when {
             paused -> "❚❚ Paused · the camera is not reading hands"
-            cameraState != "camera on" -> "Camera off"
+            cameraState == "starting camera" -> "Starting camera…"
+            cameraState != "camera on" -> "Camera unavailable: $cameraState"
             consented -> "● Reading their signs on this device · no video saved"
             else -> "Waiting for a wave · nothing is read until then"
         }
