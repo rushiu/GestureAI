@@ -60,6 +60,7 @@ class MainActivity : AppCompatActivity() {
     private var modelError: String? = null
     private var tts: TextToSpeech? = null
     private var voiceReady = false
+    private var voiceState = "starting voice"
     private var cameraState = "starting camera"
 
     private val smoother = Smoother()
@@ -95,15 +96,7 @@ class MainActivity : AppCompatActivity() {
         cameraExecutor = Executors.newSingleThreadExecutor()
         cameraExecutor.execute { loadModel() }
 
-        tts = TextToSpeech(this) { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                val result = tts?.setLanguage(Locale.US)
-                voiceReady = result != TextToSpeech.LANG_MISSING_DATA &&
-                    result != TextToSpeech.LANG_NOT_SUPPORTED
-            }
-            Log.i(TAG, "voice ready: $voiceReady")
-            updateStatus()
-        }
+        tts = TextToSpeech(this) { status -> onVoiceInit(status) }
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
             PackageManager.PERMISSION_GRANTED
@@ -114,6 +107,33 @@ class MainActivity : AppCompatActivity() {
             updateStatus()
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), CAMERA_REQUEST)
         }
+    }
+
+    /**
+     * Speech needs a text-to-speech engine installed on the glasses (they don't ship with one).
+     * eSpeak NG works: adb install it, then
+     * `adb shell settings put secure tts_default_synth com.reecedunn.espeak`.
+     */
+    private fun onVoiceInit(status: Int) {
+        val engine = tts
+        voiceState = if (status != TextToSpeech.SUCCESS || engine == null) {
+            "no voice: no speech engine"
+        } else {
+            var result = engine.setLanguage(Locale.US)
+            if (result < TextToSpeech.LANG_AVAILABLE) result = engine.setLanguage(Locale.ENGLISH)
+            when (result) {
+                TextToSpeech.LANG_MISSING_DATA -> "no voice: English voice missing"
+                TextToSpeech.LANG_NOT_SUPPORTED -> "no voice: no English voice"
+                else -> "voice on"
+            }
+        }
+        voiceReady = voiceState == "voice on"
+        Log.i(
+            TAG,
+            "voice: init status=$status default=${engine?.defaultEngine} " +
+                "installed=${engine?.engines?.map { it.name }} -> $voiceState"
+        )
+        updateStatus()
     }
 
     private fun loadModel() {
@@ -253,8 +273,7 @@ class MainActivity : AppCompatActivity() {
             recognizer == null -> "loading model"
             else -> "model ok"
         }
-        val voice = if (voiceReady) "voice on" else "text only"
-        statusText.text = "$cameraState · $model · $fps fps · $voice"
+        statusText.text = "$cameraState · $model · $fps fps · $voiceState"
     }
 
     // Tell the auto-return watcher whether we're on screen. Set before CameraX reacts to the
