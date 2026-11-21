@@ -28,6 +28,7 @@ import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.gesturerecognizer.GestureRecognizer
+import org.json.JSONObject
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -54,6 +55,15 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var bigText: TextView
     private lateinit var statusText: TextView
+    private lateinit var consentText: TextView
+    private lateinit var hintText: TextView
+    /** Until this time, the welcome card is shown (set each time the app comes to the front). */
+    private var welcomeUntil = 0L
+
+    // Consent: the camera watches someone else's hands, so nothing is read until they wave hello.
+    // After CONSENT_TIMEOUT_MS with no hands in view, it goes back to waiting for a wave.
+    @Volatile private var consented = false
+    @Volatile private var lastHandAt = 0L
     private lateinit var cameraExecutor: ExecutorService
 
     @Volatile private var recognizer: GestureRecognizer? = null
@@ -64,30 +74,52 @@ class MainActivity : AppCompatActivity() {
 
     private val smoother = Smoother()
     private var lastTimestamp = 0L
+    @Volatile private var paused = false
     private var frameCount = 0
     private var fpsWindowStart = 0L
     private var fps = 0
 
-    private val clearText = Runnable { bigText.text = "" }
+    private val clearText = Runnable {
+        bigText.text = ""
+        updateHint()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         AutoStart.startWatching(this) // come back to the front whenever the glasses wake
+        PhoneLink.commandHandler = ::onPhoneCommand
 
         bigText = TextView(this).apply {
             setTextColor(Color.GREEN)
             textSize = 64f
             gravity = Gravity.CENTER
         }
+        // Technical status for the team (fps, model, link), kept dim so judges aren't distracted.
         statusText = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            textSize = 14f
+            setTextColor(Color.rgb(90, 90, 90))
+            textSize = 11f
             setPadding(16, 8, 16, 8)
+        }
+        // Onboarding for whoever just put the glasses on: a welcome card, then a hint until the signer waves.
+        hintText = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 26f
+            gravity = Gravity.CENTER
+            setPadding(32, 0, 32, 0)
+        }
+        consentText = TextView(this).apply {
+            setTextColor(Color.rgb(255, 200, 0)) // amber, like a recording light
+            textSize = 15f
+            gravity = Gravity.CENTER
+            setPadding(16, 0, 16, 0)
         }
         val root = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
+            addView(hintText, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             addView(bigText, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+            // Just below the glasses' own status bar (clock, battery) at the top of the display.
+            addView(consentText, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.TOP).apply { topMargin = 44 })
             addView(statusText, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.START))
         }
         setContentView(root)
@@ -119,6 +151,7 @@ class MainActivity : AppCompatActivity() {
     private fun loadModel() {
         try {
             val options = GestureRecognizer.GestureRecognizerOptions.builder()
+                // CPU on purpose: the glasses' GPU delegate measured 2 fps vs 6-7 fps on CPU (no OpenCL).
                 .setBaseOptions(BaseOptions.builder().setModelAssetPath(MODEL_FILE).build())
                 .setRunningMode(RunningMode.VIDEO)
                 .setNumHands(1)
@@ -196,7 +229,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun analyze(frame: ImageProxy) {
         val model = recognizer
-        if (model == null) {
+        if (model == null || paused) { // paused: phone sent {"cmd":"pause"}
             frame.close()
             return
         }
@@ -216,13 +249,52 @@ class MainActivity : AppCompatActivity() {
                 if (top.score() >= MIN_SCORE && top.categoryName().isNotBlank()) raw = top.categoryName()
             }
 
+            if (result.landmarks().isNotEmpty()) lastHandAt = SystemClock.uptimeMillis()
+
             countFrame()
             val stable = smoother.update(raw)
-            if (stable != null) runOnUiThread { announce(stable) }
+            if (stable != null) runOnUiThread { onStableGesture(stable) }
         } catch (e: Exception) {
             Log.e(TAG, "frame failed", e)
         } finally {
             frame.close()
+        }
+    }
+
+    /** Consent gate: until the signer waves, only the wave itself is acted on. */
+    private fun onStableGesture(label: String) {
+        if (consented) {
+            announce(label)
+            return
+        }
+        if (label in START_LABELS) {
+            consented = true
+            lastHandAt = SystemClock.uptimeMillis()
+            Log.i(TAG, "consent: signer waved ($label), reading signs")
+            announce(label)
+            updateStatus()
+        }
+    }
+
+    /** Middle of the display when no sign is showing: welcome card first, then what to do next. */
+    private fun updateHint() {
+        val showingSign = bigText.text.isNotEmpty()
+        hintText.text = when {
+            showingSign -> ""
+            SystemClock.uptimeMillis() < welcomeUntil ->
+                "Gesture Glasses\n\nSigns from the person\nin front of you appear here"
+            paused -> ""
+            consented -> "Watching their hands…"
+            else -> "Ask them to wave hello"
+        }
+        hintText.setTextColor(if (consented) Color.rgb(120, 120, 120) else Color.WHITE)
+    }
+
+    private fun checkConsentTimeout() {
+        if (consented && SystemClock.uptimeMillis() - lastHandAt > CONSENT_TIMEOUT_MS) {
+            consented = false
+            smoother.reset()
+            Log.i(TAG, "consent: no hands for ${CONSENT_TIMEOUT_MS / 1000}s, waiting for a wave")
         }
     }
 
@@ -233,6 +305,25 @@ class MainActivity : AppCompatActivity() {
         bigText.removeCallbacks(clearText)
         bigText.postDelayed(clearText, 3000)
         if (voiceReady) tts?.speak(phrase, TextToSpeech.QUEUE_FLUSH, null, "gesture")
+        PhoneLink.send(JSONObject().put("event", "gesture").put("label", label).put("text", phrase))
+    }
+
+    /** Commands from the phone over Bluetooth (see PhoneLink). Runs on the main thread. */
+    private fun onPhoneCommand(msg: JSONObject) {
+        when (msg.optString("cmd")) {
+            "pause" -> paused = true
+            "resume" -> { paused = false; smoother.reset() }
+            "text" -> {
+                bigText.text = msg.optString("text")
+                bigText.removeCallbacks(clearText)
+                bigText.postDelayed(clearText, 3000)
+            }
+        }
+        if (msg.optString("cmd") == "pause" || msg.optString("cmd") == "resume") {
+            if (paused) fps = 0
+            PhoneLink.send(JSONObject().put("event", "state").put("paused", paused))
+        }
+        updateStatus()
     }
 
     private fun countFrame() {
@@ -254,7 +345,16 @@ class MainActivity : AppCompatActivity() {
             else -> "model ok"
         }
         val voice = if (voiceReady) "voice on" else "text only"
-        statusText.text = "$cameraState · $model · $fps fps · $voice"
+        checkConsentTimeout()
+        consentText.text = when {
+            paused -> "❚❚ Paused · the camera is not reading hands"
+            cameraState != "camera on" -> "Camera off"
+            consented -> "● Reading their signs on this device · no video saved"
+            else -> "Waiting for a wave · nothing is read until then"
+        }
+        updateHint()
+        val run = if (paused) "PAUSED" else "$fps fps"
+        statusText.text = "$cameraState · $model · $run · $voice · ${PhoneLink.status}"
     }
 
     // Tell the auto-return watcher whether we're on screen. Set before CameraX reacts to the
@@ -262,6 +362,13 @@ class MainActivity : AppCompatActivity() {
     override fun onStart() {
         AutoStart.onScreen = true
         super.onStart()
+        // New wearer (glasses just put on / woken): show the welcome card, then the hint,
+        // and ask for a fresh wave so the person signing consents again.
+        welcomeUntil = SystemClock.uptimeMillis() + WELCOME_MS
+        consented = false
+        smoother.reset()
+        updateStatus()
+        hintText.postDelayed({ updateStatus() }, WELCOME_MS + 100)
     }
 
     override fun onStop() {
@@ -272,6 +379,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        if (PhoneLink.commandHandler == ::onPhoneCommand) PhoneLink.commandHandler = null
         tts?.shutdown()
         cameraExecutor.execute { recognizer?.close() }
         cameraExecutor.shutdown()
@@ -282,6 +390,10 @@ class MainActivity : AppCompatActivity() {
         private const val MODEL_FILE = "gesture_recognizer.task"
         private const val CAMERA_REQUEST = 1
         private const val MIN_SCORE = 0.6f
+        /** Gestures that mean "you may read my signs": the stock open palm, or a trained "hello"/"start" sign. */
+        private val START_LABELS = setOf("Open_Palm", "hello", "start")
+        private const val CONSENT_TIMEOUT_MS = 30_000L
+        private const val WELCOME_MS = 4_000L
         const val NONE = "None"
     }
 }
@@ -299,6 +411,11 @@ class Smoother(
     private val history = ArrayDeque<String>()
     private var lastSent: String? = null
     private var lastSentAt = 0L
+
+    fun reset() {
+        history.clear()
+        lastSent = null
+    }
 
     fun update(raw: String): String? {
         history.addLast(raw)

@@ -132,6 +132,7 @@ class WakeWatcher : Service() {
         registered = true
 
         getSystemService(CameraManager::class.java).registerAvailabilityCallback(cameraWatch, handler)
+        PhoneLink.start(this) // listen for commands from the phone (lives as long as this service)
         handler.postDelayed(backgroundCheck, 3_000)
     }
 
