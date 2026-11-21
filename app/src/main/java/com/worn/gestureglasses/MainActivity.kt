@@ -424,8 +424,9 @@ class MainActivity : AppCompatActivity() {
  * and two events are at least [cooldownMs] apart.
  */
 class Smoother(
-    private val window: Int = 6,
-    private val needed: Int = 4,
+    // 3 of the last 5 frames: about 0.6 s at the glasses' 5-7 fps (was 4 of 6, about 1 s).
+    private val window: Int = 5,
+    private val needed: Int = 3,
     private val cooldownMs: Long = 1500,
 ) {
     private val history = ArrayDeque<String>()
