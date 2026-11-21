@@ -2,9 +2,7 @@ package com.worn.gestureglasses
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
 import android.graphics.Color
-import android.graphics.Matrix
 import android.os.Bundle
 import android.os.SystemClock
 import android.speech.tts.TextToSpeech
@@ -27,20 +25,17 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
-import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
+import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.gesturerecognizer.GestureRecognizer
-import com.google.mediapipe.tasks.vision.gesturerecognizer.GestureRecognizerResult
 import org.json.JSONObject
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import kotlin.math.hypot
 
 /**
  * Runs entirely on the M6 glasses:
- * glasses camera -> MediaPipe gesture model (held hand shapes) + ASL sign model (moving signs)
- * -> big text on the display (+ spoken, if the glasses have a voice).
+ * glasses camera -> MediaPipe gesture model -> big text on the display (+ spoken, if the glasses have a voice).
  *
  * Logs: `adb logcat -s Gesture`
  */
@@ -56,30 +51,7 @@ class MainActivity : AppCompatActivity() {
         "Pointing_Up" to "Wait",
         "Victory" to "Peace",
         "ILoveYou" to "I love you",
-        // ASL signs: the sign model's word list runs some words together. Other signs show as-is.
-        "hello" to "Hello",
-        "thankyou" to "Thank you",
-        "please" to "Please",
-        "yes" to "Yes",
-        "no" to "No",
-        "callonphone" to "Call on phone",
-        "frenchfries" to "French fries",
-        "glasswindow" to "Window",
-        "haveto" to "Have to",
-        "hesheit" to "He / she / it",
-        "minemy" to "Mine / my",
-        "weus" to "We / us",
-        "icecream" to "Ice cream",
     )
-
-    // ASL signs (pretrained 250-sign model, e.g. "thank you"), read after the signer waves, alongside gestures.
-    // Loaded on the camera thread at start-up. Only touched on that thread.
-    @Volatile private var signLandmarks: LandmarkExtractor? = null
-    @Volatile private var signClassifier: SignClassifier? = null
-    @Volatile private var signModelError: String? = null
-    private val segmenter = SignSegmenter()
-    private var lastWrist: FloatArray? = null
-    private var lastWristAt = 0L
 
     private lateinit var bigText: TextView
     private lateinit var statusText: TextView
@@ -224,8 +196,6 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "model failed to load", e)
         }
         runOnUiThread { updateStatus() }
-        // Load the ASL models now, so signs are read as soon as the signer waves.
-        loadSignModels()
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
@@ -297,20 +267,14 @@ class MainActivity : AppCompatActivity() {
             return
         }
         try {
+            val image = BitmapImageBuilder(frame.toBitmap()).build()
+            val rotation = ImageProcessingOptions.builder()
+                .setRotationDegrees(frame.imageInfo.rotationDegrees)
+                .build()
             val timestamp = maxOf(SystemClock.uptimeMillis(), lastTimestamp + 1)
             lastTimestamp = timestamp
-            val bitmap = frame.toBitmap().upright(frame.imageInfo.rotationDegrees)
 
-            // After the wave, ASL signs are read too. Then hands are only looked for above mid-torso
-            // (see LandmarkExtractor), which skips a hand resting at the hip and is faster for both.
-            val signs = signLandmarks.takeIf { consented && signClassifier != null }
-            val area = signs?.searchArea(bitmap, timestamp)
-
-            // One hand tracker for both: the gesture model finds the hand's points while it classifies.
-            val handsStart = SystemClock.uptimeMillis()
-            val result = model.recognizeForVideo(BitmapImageBuilder(area?.bitmap ?: bitmap).build(), timestamp)
-            val handsMs = SystemClock.uptimeMillis() - handsStart
-
+            val result = model.recognizeForVideo(image, rotation, timestamp)
             var raw = NONE
             val hands = result.gestures()
             if (hands.isNotEmpty() && hands[0].isNotEmpty()) {
@@ -319,16 +283,8 @@ class MainActivity : AppCompatActivity() {
             }
 
             if (result.landmarks().isNotEmpty()) lastHandAt = SystemClock.uptimeMillis()
+
             countFrame()
-            if (DUMP_SIGN_CLIPS) logGesture(result, bitmap, timestamp)
-
-            if (signs != null && area != null) {
-                // Gestures are held hand shapes; a moving hand is left to the ASL reader. Otherwise flat-hand
-                // signs like "thank you" would also show as Open_Palm ("Hello").
-                if (handMoving(result.landmarks(), area.yScale, signs, timestamp)) raw = NONE
-                analyzeSigns(bitmap, area, result.landmarks(), handsMs, timestamp)
-            }
-
             val stable = smoother.update(raw)
             if (stable != null) runOnUiThread { onStableGesture(stable) }
         } catch (e: Exception) {
@@ -338,132 +294,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private var lastGestureLogAt = 0L
-
-    /** Debugging: what the gesture model sees, at most twice a second, plus the picture while waiting for a wave. */
-    private fun logGesture(result: GestureRecognizerResult, bitmap: Bitmap, timestamp: Long) {
-        if (timestamp - lastGestureLogAt < 500) return
-        lastGestureLogAt = timestamp
-        val top = result.gestures().firstOrNull()?.firstOrNull()
-        val wrist = result.landmarks().firstOrNull()?.get(0)
-        Log.i(
-            TAG,
-            "seen: " + if (wrist == null) "no hand" else
-                "${top?.categoryName()} ${"%.2f".format(top?.score() ?: 0f)} at (${"%.2f".format(wrist.x())}, ${"%.2f".format(wrist.y())})" +
-                    " · consented=$consented",
-        )
-        if (!consented) dumpFrame(bitmap, null, timestamp)
-    }
-
-    /** True unless the hand's wrist is held still (below [GESTURE_STILL_SPEED] shoulder widths per second). */
-    private fun handMoving(
-        hands: List<List<NormalizedLandmark>>,
-        yScale: Float,
-        signs: LandmarkExtractor,
-        timestamp: Long,
-    ): Boolean {
-        val wrist = hands.firstOrNull()?.get(0)
-        if (wrist == null) {
-            lastWrist = null
-            return false
-        }
-        val here = floatArrayOf(wrist.x(), wrist.y() * yScale)
-        val before = lastWrist
-        val dt = timestamp - lastWristAt
-        lastWrist = here
-        lastWristAt = timestamp
-        if (before == null || dt <= 0) return true // just appeared: not known to be held still yet
-        val scale = signs.bodyScale(timestamp) ?: 0.2f
-        val speed = hypot(here[0] - before[0], here[1] - before[1]) / scale * 1000f / dt
-        return speed >= GESTURE_STILL_SPEED
-    }
-
-    /**
-     * ASL signs: body + face points are added to the hand, the frames are cut into one clip per sign,
-     * and each clip gets one prediction (the sign model looks at the whole movement, so no Smoother).
-     */
-    private fun analyzeSigns(
-        bitmap: Bitmap,
-        area: LandmarkExtractor.SearchArea,
-        hands: List<List<NormalizedLandmark>>,
-        handsMs: Long,
-        timestamp: Long,
-    ) {
-        val landmarks = signLandmarks ?: return
-        val classifier = signClassifier ?: return
-
-        val frame = landmarks.extract(bitmap, area, hands, handsMs, timestamp)
-        if (frame.handsVisible) lastHandAt = SystemClock.uptimeMillis()
-        if (DUMP_SIGN_CLIPS && frame.points != null) dumpFrame(bitmap, landmarks.lastFaceCrop, timestamp)
-
-        val clip = segmenter.onFrame(timestamp, frame.points) ?: return
-        val modelStart = SystemClock.uptimeMillis()
-        val sign = classifier.classify(clip)
-        val modelMs = SystemClock.uptimeMillis() - modelStart
-        val raw = segmenter.lastRaw?.first?.size ?: 0
-        Log.i(
-            TAG,
-            "sign ${sign.sign} p=${"%.2f".format(sign.probability)} (then ${sign.runnersUp}) " +
-                "from $raw frames, ended ${segmenter.lastEnd}, model ${modelMs}ms",
-        )
-        if (DUMP_SIGN_CLIPS) segmenter.lastRaw?.let { (frames, times) -> dumpClip(frames, times, sign.sign) }
-        if (sign.probability >= MIN_SIGN_PROBABILITY) runOnUiThread { onStableGesture(sign.sign) }
-    }
-
-    private fun Bitmap.upright(degrees: Int): Bitmap =
-        if (degrees == 0) this
-        else Bitmap.createBitmap(this, 0, 0, width, height, Matrix().apply { postRotate(degrees.toFloat()) }, true)
-
-    private var dumpedFrames = 0
-
-    /** Debugging: saves the camera frame and face crop for each raised-hand frame (first 300 per run). */
-    private fun dumpFrame(bitmap: Bitmap, faceCrop: Bitmap?, timestamp: Long) {
-        if (dumpedFrames++ >= 300) return
-        try {
-            val dir = java.io.File(getExternalFilesDir(null), "frames").apply { mkdirs() }
-            java.io.File(dir, "${timestamp}_camera.jpg").outputStream().use { bitmap.compress(Bitmap.CompressFormat.JPEG, 85, it) }
-            faceCrop?.let { crop ->
-                java.io.File(dir, "${timestamp}_face.jpg").outputStream().use { crop.compress(Bitmap.CompressFormat.JPEG, 85, it) }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "frame dump failed", e)
-        }
-    }
-
-    /**
-     * Debugging: saves each clip's raw points so they can be checked against the model on a computer.
-     * `adb pull /sdcard/Android/data/com.worn.gestureglasses/files/clips`
-     * Format: int frames, int floatsPerFrame, then frames x long timestampMs, then frames x floats (little-endian).
-     */
-    private fun dumpClip(frames: List<FloatArray>, times: List<Long>, guess: String) {
-        try {
-            val dir = java.io.File(getExternalFilesDir(null), "clips").apply { mkdirs() }
-            val per = frames.first().size
-            val buf = java.nio.ByteBuffer.allocate(8 + frames.size * 8 + frames.size * per * 4)
-                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-            buf.putInt(frames.size).putInt(per)
-            times.forEach { buf.putLong(it) }
-            frames.forEach { f -> f.forEach { buf.putFloat(it) } }
-            java.io.File(dir, "clip_${System.currentTimeMillis()}_$guess.bin").writeBytes(buf.array())
-        } catch (e: Exception) {
-            Log.w(TAG, "clip dump failed", e)
-        }
-    }
-
-    /** Runs on the camera thread; takes a few seconds on the glasses. */
-    private fun loadSignModels() {
-        runOnUiThread { updateStatus() }
-        try {
-            signLandmarks = LandmarkExtractor(this)
-            signClassifier = SignClassifier(this)
-            Log.i(TAG, "ASL model loaded")
-        } catch (e: Exception) {
-            signModelError = e.message ?: e.javaClass.simpleName
-            Log.e(TAG, "ASL model failed to load", e)
-        }
-        runOnUiThread { updateStatus() }
-    }
-
     /** Consent gate: until the signer waves, only the wave itself is acted on. */
     private fun onStableGesture(label: String) {
         if (consented) {
@@ -471,7 +301,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
         if (label in START_LABELS) {
-            if (::cameraExecutor.isInitialized) cameraExecutor.execute { segmenter.reset() }
             consented = true
             lastHandAt = SystemClock.uptimeMillis()
             Log.i(TAG, "consent: signer waved ($label), reading signs")
@@ -529,11 +358,7 @@ class MainActivity : AppCompatActivity() {
     private fun onPhoneCommand(msg: JSONObject) {
         when (msg.optString("cmd")) {
             "pause" -> paused = true
-            "resume" -> {
-                paused = false
-                smoother.reset()
-                cameraExecutor.execute { segmenter.reset() }
-            }
+            "resume" -> { paused = false; smoother.reset() }
             "text" -> {
                 bigText.text = msg.optString("text")
                 bigText.removeCallbacks(clearText)
@@ -560,17 +385,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateStatus() {
-        val gestureModel = when {
+        val model = when {
             modelError != null -> "MODEL ERROR: $modelError"
             recognizer == null -> "loading model"
             else -> "model ok"
         }
-        val signModel = when {
-            signModelError != null -> "ASL MODEL ERROR: $signModelError"
-            signClassifier == null -> "loading ASL"
-            else -> "ASL ok"
-        }
-        val model = "$gestureModel · $signModel"
         checkConsentTimeout()
         consentText.text = when {
             paused -> "❚❚ Paused · the camera is not reading hands"
@@ -609,11 +428,7 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         if (PhoneLink.commandHandler == ::onPhoneCommand) PhoneLink.commandHandler = null
         tts?.shutdown()
-        cameraExecutor.execute {
-            recognizer?.close()
-            signLandmarks?.close()
-            signClassifier?.close()
-        }
+        cameraExecutor.execute { recognizer?.close() }
         cameraExecutor.shutdown()
     }
 
@@ -622,12 +437,6 @@ class MainActivity : AppCompatActivity() {
         private const val MODEL_FILE = "gesture_recognizer.task"
         private const val CAMERA_REQUEST = 1
         private const val MIN_SCORE = 0.6f
-        /** ASL signs below this are skipped (the model always picks one of its 250 words). */
-        private const val MIN_SIGN_PROBABILITY = 0.4f
-        /** Debugging: save each ASL clip, camera frames and face crops to the glasses, and log what the gesture model sees. Keep off outside testing: the consent banner promises no video is saved. */
-        private const val DUMP_SIGN_CLIPS = false
-        /** After the wave, a gesture only counts while the hand is held this still (shoulder widths per second). */
-        private const val GESTURE_STILL_SPEED = 0.4f
         /** Gestures that mean "you may read my signs": the stock open palm, or a trained "hello"/"start" sign. */
         private val START_LABELS = setOf("Open_Palm", "hello", "start")
         private const val CONSENT_TIMEOUT_MS = 30_000L

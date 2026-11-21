@@ -3,8 +3,3 @@ build/
 local.properties
 .idea/
 *.iml
-# Downloaded on first build by app/build.gradle.kts (about 30 MB).
-app/src/main/assets/pose_landmarker_lite.task
-app/src/main/assets/face_landmarker.task
-app/src/main/assets/asl_signs.tflite
-app/src/main/assets/sign_to_prediction_index_map.json
